@@ -4,7 +4,7 @@ import nodemailer from 'nodemailer';
 import {DatabaseSync} from 'node:sqlite';
 import {randomBytes, scrypt, timingSafeEqual} from 'node:crypto';
 import {promisify} from 'node:util';
-import {mkdirSync, readFileSync, writeFileSync} from 'node:fs';
+import {mkdirSync, readFileSync, writeFileSync, existsSync} from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {makeCatalog, defaults, validateContent, renderContent, renderCSS} from './backend/content.js';
@@ -13,6 +13,20 @@ const derive = promisify(scrypt);
 export async function passwordHash(password) {
   const salt = randomBytes(16).toString('hex');
   return `${salt}:${(await derive(password,salt,64)).toString('hex')}`;
+}
+// Provision from private host environment variables when shell access is unavailable.
+// An existing account is never overwritten by a restart.
+export async function provisionAdminFromEnvironment(env = process.env, dataDir = path.resolve(env.DATA_DIR || path.join(root, 'data'))) {
+  const target = path.join(dataDir, 'admin.json');
+  if (existsSync(target)) return false;
+  if (!env.ADMIN_USERNAME && !env.ADMIN_PASSWORD) return false;
+  if (!/^[a-zA-Z0-9_.-]{3,80}$/.test(env.ADMIN_USERNAME || '')) throw new Error('ADMIN_USERNAME must contain 3 to 80 letters, numbers, dots, underscores or hyphens.');
+  if (typeof env.ADMIN_PASSWORD !== 'string' || env.ADMIN_PASSWORD.length < 12 || env.ADMIN_PASSWORD.length > 256) throw new Error('ADMIN_PASSWORD must contain 12 to 256 characters.');
+  const config = {username: env.ADMIN_USERNAME, passwordHash: await passwordHash(env.ADMIN_PASSWORD)};
+  mkdirSync(dataDir, {recursive: true, mode: 0o700});
+  try { writeFileSync(target, JSON.stringify(config), {mode: 0o600, flag: 'wx'}); }
+  catch (error) { if (error.code === 'EEXIST') return false; throw error; }
+  return true;
 }
 async function checkPassword(password, hash) {
   if (!hash || typeof password !== 'string' || password.length > 256) return false;
@@ -77,7 +91,7 @@ export function createApp(options = {}) {
   app.get('/api/admin/session',requireAdmin,(req,res)=>res.json({csrf:req.session.csrf}));
   app.post('/api/admin/login',sameOrigin,rate('login',10,15*60*1000),async(req,res)=>{
     let config;
-    try {config=JSON.parse(readFileSync(path.join(dataDir,'admin.json'),'utf8'));} catch {return res.status(503).json({error:'Admin account has not been configured. Run npm run setup-admin on the server.'});}
+    try {config=JSON.parse(readFileSync(path.join(dataDir,'admin.json'),'utf8'));} catch {return res.status(503).json({error:'Admin account has not been configured. Set ADMIN_USERNAME and ADMIN_PASSWORD on the host, then restart, or run npm run setup-admin in a terminal.'});}
     const ok=await checkPassword(req.body?.password,config.passwordHash);
     if (!ok || req.body?.username !== config.username) return res.status(401).json({error:'Incorrect username or password.'});
     for (const [key,s] of sessions) if (s.expires<Date.now()) sessions.delete(key);
@@ -169,6 +183,7 @@ export function createApp(options = {}) {
   return {app,close:()=>db.close()};
 }
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  await provisionAdminFromEnvironment();
   const {app}=createApp();
   app.listen(Number(process.env.PORT||3000),process.env.HOST||'0.0.0.0',()=>console.log(`Lulu Centre running on port ${process.env.PORT||3000}`));
 }
